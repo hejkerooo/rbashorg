@@ -1,0 +1,14 @@
+[package]
+name = "rbashorg"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+edition = "2018"
+name = "whatever_name_for_binary"
+path = "src/main.rs"
+
+[dependencies]
+directories = "5.0"
+reqwest = { version = "0.11.24", features = ["blocking"] }
+rand = "0.8.5"

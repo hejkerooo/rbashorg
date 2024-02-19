@@ -2,15 +2,17 @@ extern crate directories;
 
 use std::{fs, io};
 use std::fs::File;
-use std::io::{Cursor, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, Write, SeekFrom};
+use std::path::{PathBuf};
 use directories::{ProjectDirs};
-use std::io::Write;
-use rand::seq::SliceRandom;
+use rand::Rng;
+use std::net::TcpStream;
 
 struct DirManager {
     base_dir: String,
 }
+
+const HOST: &str = "bash.org.pl";
 
 impl DirManager {
     pub fn prepare() -> DirManager {
@@ -50,61 +52,73 @@ impl DirManager {
     }
 }
 
-fn read_bytes<P>(filename: P) -> io::Result<io::Bytes<io::BufReader<File>>> where P: AsRef<Path>, {
-    let file = File::open(filename)?;
+fn download_file(dest: &PathBuf) -> io::Result<()> {
+    let mut stream = TcpStream::connect(format!("{}:80", HOST))?;
 
-    Ok(io::BufReader::new(file).bytes())
-}
+    let request = format!("GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", "/text", HOST);
+    stream.write_all(request.as_bytes())?;
 
-fn download_file(dest: &PathBuf) -> io::Result<String> {
-    let response = reqwest::blocking::get("http://bash.org.pl/text")
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
 
-    if !response.status().is_success() {
-        return Err(io::Error::new(io::ErrorKind::Other, "Request failed"));
+    if let Some(index) = response.windows(4).position(|window| window == b"\r\n\r\n") {
+        let mut file = File::create(dest)?;
+        file.write_all(&response[index + 4..])?;
+    } else {
+        return Err(io::Error::new(io::ErrorKind::Other, "Response header not found"));
     }
 
-    let mut file = File::create(dest)?;
-
-    let content = response.bytes().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let mut content = Cursor::new(content);
-    io::copy(&mut content, &mut file)?;
-
-    Ok(dest.to_str().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Path contains invalid UTF-8"))?.to_owned())
+    Ok(())
 }
 
-fn get_byte_pos(file_path: &PathBuf) -> io::Result<Vec<(u32, u32)>> {
-    let mut pos: Vec<(u32, u32)> = vec![];
-    let mut current_pos: u32 = 0;
+fn find_random_percent_positions(file_path: &PathBuf) -> std::io::Result<(u32, u32)> {
+    let file = File::open(file_path).expect("Failed to load file");
+    let file_size = file.metadata().expect("Failed to load file metadata").len() as u32;
 
-    let bytes = read_bytes(file_path)?;
+    let mut rng = rand::thread_rng();
+    let random_start_pos = rng.gen_range(0..file_size);
 
-    for line in bytes {
-        current_pos += 1;
+    let mut start_pos = random_start_pos;
+    let mut end_pos = file_size;
 
-        if line.is_err() {
-            continue;
+    let mut next_percent_pos = None;
+
+    while start_pos < end_pos {
+        let (bytes, _, _) = get_partial_bytes(file_path, &start_pos, &end_pos);
+
+        if let Some(pos) = bytes.iter().position(|&b| b == b'%') {
+            next_percent_pos = Some(start_pos + pos as u32);
+            break;
         }
 
-        if line.unwrap() == b'%' {
-            match pos.last() {
-                None => pos.push((0, current_pos)),
-                Some(&(_start, end)) => {
-                    if current_pos - end == 0 {
-                        continue;
-                    }
+        start_pos += bytes.len() as u32;
+    }
 
-                    pos.push((end.clone(), current_pos))
-                }
+    let mut prev_percent_pos = None;
+    if let Some(pos) = next_percent_pos {
+        start_pos = if pos > 1 { 0 } else { pos - 1 };
+        end_pos = pos;
+
+        while start_pos < end_pos {
+            let (bytes, start, _) = get_partial_bytes(file_path, &start_pos, &end_pos);
+
+            if let Some(pos) = bytes.iter().rposition(|&b| b == b'%') {
+                prev_percent_pos = Some(start + pos as u32);
+                break;
             }
+
+            if start_pos == 0 {
+                break;
+            }
+
+            start_pos = start.saturating_sub(bytes.len() as u32);
         }
     }
 
-    Ok(pos)
-}
-
-fn get_random(indexes: &Vec<(u32, u32)>) -> Option<&(u32, u32)> {
-    indexes.choose(&mut rand::thread_rng())
+    match (prev_percent_pos, next_percent_pos) {
+        (Some(prev), Some(next)) => Ok((prev + 1, next)),
+        _ => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Percent signs not found")),
+    }
 }
 
 fn print_chunks(joke_chunk: Utf8Chunk, append_bytes: &mut Vec<u8>) {
@@ -132,17 +146,15 @@ fn print_chunks(joke_chunk: Utf8Chunk, append_bytes: &mut Vec<u8>) {
 }
 
 fn prepare_chunks(dir_manager: DirManager, destination: &PathBuf) -> Utf8Chunk {
-    let pos = if !dir_manager.indexes_exists() { Some(get_byte_pos(&destination)) } else { None }.expect("Failed to read byte pos");
+    let pos = if !dir_manager.indexes_exists() { Some(find_random_percent_positions(&destination).expect("Failed to find percentage")) } else { None }.expect("Failed to read byte pos");
 
-    let binding = pos.unwrap();
-
-    let (start, end) = get_random(&binding).unwrap();
+    let (start, end) = pos;
 
     let interval: u32 = 5;
 
     let joke_chunk = Utf8Chunk {
         index: 0,
-        chunks: divide_range_into_intervals(*start, *end, interval)
+        chunks: divide_range_into_intervals(start, end, interval)
             .iter().map(|(s, e)| {
             Joke {
                 start: *s,
